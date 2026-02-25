@@ -1,6 +1,9 @@
 package main
 
 import (
+	"os/signal"
+	"syscall"
+	"context"
 	"crypto/md5"
 	"fmt"
 	"io"
@@ -21,6 +24,17 @@ type BackupResult struct {
 }
 
 func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		cancel()
+	}()
+
 	if len(os.Args) < 2 {
 		fmt.Println(color.CyanString("backuptest - Backup Integrity Validator"))
 		fmt.Println()
@@ -33,12 +47,23 @@ func main() {
 	}
 
 	backupPath := os.Args[1]
-	results := validateBackup(backupPath)
+	results := validateBackup(ctx, backupPath)
 	displayResults(results)
 }
 
-func validateBackup(backupPath string) []BackupResult {
+func validateBackup(ctx context.Context, backupPath string) []BackupResult {
 	var results []BackupResult
+
+	select {
+	case <-ctx.Done():
+		results = append(results, BackupResult{
+			BackupPath: backupPath,
+			Status:     "ERROR",
+			Error:      "context cancelled",
+		})
+		return results
+	default:
+	}
 
 	info, err := os.Stat(backupPath)
 	if err != nil {
@@ -53,6 +78,12 @@ func validateBackup(backupPath string) []BackupResult {
 	if info.IsDir() {
 		// Directory backup - validate all files
 		filepath.Walk(backupPath, func(path string, info os.FileInfo, err error) error {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+
 			if err != nil {
 				results = append(results, BackupResult{
 					BackupPath: path,
@@ -63,23 +94,31 @@ func validateBackup(backupPath string) []BackupResult {
 			}
 
 			if !info.IsDir() {
-				result := validateFile(path)
+				result := validateFile(ctx, path)
 				results = append(results, result)
 			}
 			return nil
 		})
 	} else {
 		// Single file backup
-		results = append(results, validateFile(backupPath))
+		results = append(results, validateFile(ctx, backupPath))
 	}
 
 	return results
 }
 
-func validateFile(filePath string) BackupResult {
+func validateFile(ctx context.Context, filePath string) BackupResult {
 	result := BackupResult{
 		BackupPath: filePath,
 		TestTime:   time.Now(),
+	}
+
+	select {
+	case <-ctx.Done():
+		result.Status = "ERROR"
+		result.Error = "context cancelled"
+		return result
+	default:
 	}
 
 	// Check file exists and is readable
@@ -101,7 +140,7 @@ func validateFile(filePath string) BackupResult {
 	result.Size = info.Size()
 
 	// Calculate checksum
-	checksum, err := calculateChecksum(filePath)
+	checksum, err := calculateChecksum(ctx, filePath)
 	if err != nil {
 		result.Status = "ERROR"
 		result.Error = err.Error()
@@ -120,7 +159,7 @@ func validateFile(filePath string) BackupResult {
 	return result
 }
 
-func calculateChecksum(filePath string) (string, error) {
+func calculateChecksum(ctx context.Context, filePath string) (string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return "", err
@@ -130,6 +169,12 @@ func calculateChecksum(filePath string) (string, error) {
 	hash := md5.New()
 	if _, err := io.Copy(hash, file); err != nil {
 		return "", err
+	}
+
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	default:
 	}
 
 	return fmt.Sprintf("%x", hash.Sum(nil)), nil
